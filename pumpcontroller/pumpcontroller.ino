@@ -1,37 +1,45 @@
 /************************************************************
  * Project : Smart Pump Controller (RTOS)
+ * Mode    : AUTO + MANUAL via SERIAL
  * MCU     : ESP32
- * IDE     : Arduino
- * RTOS    : FreeRTOS (built-in)
- * Version : Clean / Fixed / Production-ready
  ************************************************************/
 
 #include <Arduino.h>
 
 /* ================= PIN DEFINITIONS ================= */
-#define LED_PIN           2     // Heartbeat LED
-#define SOIL_SENSOR_PIN   34    // ADC pin
-#define RELAY_PIN         26    // Pump relay
+#define LED_PIN           2
+#define SOIL_SENSOR_PIN   34
+#define RELAY_PIN         26
 
-/* ================= THRESHOLDS ================= */
 #define SOIL_DRY_THRESHOLD 2000
 
 /* ================= RTOS HANDLES ================= */
 QueueHandle_t soilQueue;
+QueueHandle_t commandQueue;
 TaskHandle_t relayTaskHandle = NULL;
 
 /* ================= ENUMS ================= */
 enum PumpCommand : uint32_t {
-  PUMP_OFF = 0,
-  PUMP_ON  = 1
+  CMD_PUMP_OFF = 0,
+  CMD_PUMP_ON  = 1,
+  CMD_BACK_TO_AUTO
 };
 
-/* ================= HEARTBEAT TASK =================
- * Shows system is alive
- ****************************************************/
+enum ControlMode {
+  MODE_AUTO,
+  MODE_MANUAL
+};
+
+enum PumpState {
+  AUTO_OFF,
+  AUTO_ON,
+  MANUAL_OFF,
+  MANUAL_ON
+};
+
+/* ================= HEARTBEAT TASK ================= */
 void heartbeatTask(void *pvParameters) {
   pinMode(LED_PIN, OUTPUT);
-
   while (1) {
     digitalWrite(LED_PIN, HIGH);
     vTaskDelay(pdMS_TO_TICKS(200));
@@ -40,90 +48,114 @@ void heartbeatTask(void *pvParameters) {
   }
 }
 
-/* ================= SENSOR TASK =================
- * Reads soil moisture and sends to control task
- ****************************************************/
+/* ================= SENSOR TASK ================= */
 void sensorTask(void *pvParameters) {
   int soilValue;
-
   while (1) {
-    // Replace with analogRead(SOIL_SENSOR_PIN) later
-    soilValue = 2000;  // Test value
-
+    soilValue = 2000;  // REAL sensor now
     xQueueSend(soilQueue, &soilValue, portMAX_DELAY);
 
     Serial.print("[Sensor] Soil Value: ");
     Serial.println(soilValue);
 
-    vTaskDelay(pdMS_TO_TICKS(2000));  // Every 2 seconds
+    vTaskDelay(pdMS_TO_TICKS(2000));
   }
 }
 
-/* ================= CONTROL TASK =================
- * Central decision-making logic (AUTO mode)
- ****************************************************/
+/* ================= SERIAL MANUAL CONTROL TASK =================
+ * Commands:
+ * ON   -> Manual ON
+ * OFF  -> Manual OFF
+ * AUTO -> Back to AUTO
+ ************************************************************/
+void serialTask(void *pvParameters) {
+  String cmdStr;
+  PumpCommand cmd;
+
+  while (1) {
+    if (Serial.available()) {
+      cmdStr = Serial.readStringUntil('\n');
+      cmdStr.trim();
+      cmdStr.toUpperCase();
+
+      if (cmdStr == "ON") {
+        cmd = CMD_PUMP_ON;
+        Serial.println("[Serial] MANUAL ON");
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      }
+      else if (cmdStr == "OFF") {
+        cmd = CMD_PUMP_OFF;
+        Serial.println("[Serial] MANUAL OFF");
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      }
+      else if (cmdStr == "AUTO") {
+        cmd = CMD_BACK_TO_AUTO;
+        Serial.println("[Serial] BACK TO AUTO");
+        xQueueSend(commandQueue, &cmd, portMAX_DELAY);
+      }
+      else {
+        Serial.println("[Serial] Invalid command (ON / OFF / AUTO)");
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+/* ================= CONTROL TASK ================= */
 void controlTask(void *pvParameters) {
   int soilValue;
-  PumpCommand pumpCommand;
+  PumpCommand cmd;
+  ControlMode mode = MODE_AUTO;
+  PumpState state = AUTO_OFF;
 
   while (1) {
-    if (xQueueReceive(soilQueue, &soilValue, portMAX_DELAY)) {
 
-      if (soilValue < SOIL_DRY_THRESHOLD) {
-        pumpCommand = PUMP_ON;
-        Serial.println("[Control] Soil dry → Pump ON");
+    /* ---- Handle MANUAL commands ---- */
+    if (xQueueReceive(commandQueue, &cmd, 0)) {
+
+      if (cmd == CMD_BACK_TO_AUTO) {
+        mode = MODE_AUTO;
+        Serial.println("[Control] Mode → AUTO");
       } else {
-        pumpCommand = PUMP_OFF;
-        Serial.println("[Control] Soil wet → Pump OFF");
-      }
-
-      // Defensive check before notifying
-      if (relayTaskHandle != NULL) {
-        xTaskNotify(
-          relayTaskHandle,
-          pumpCommand,
-          eSetValueWithOverwrite
-        );
+        mode = MODE_MANUAL;
+        state = (cmd == CMD_PUMP_ON) ? MANUAL_ON : MANUAL_OFF;
+        xTaskNotify(relayTaskHandle, cmd, eSetValueWithOverwrite);
+        Serial.println("[Control] Mode → MANUAL");
       }
     }
+
+    /* ---- AUTO mode logic ---- */
+    if (mode == MODE_AUTO) {
+      if (xQueueReceive(soilQueue, &soilValue, portMAX_DELAY)) {
+
+        if (soilValue < SOIL_DRY_THRESHOLD && state != AUTO_ON) {
+          state = AUTO_ON;
+          xTaskNotify(relayTaskHandle, CMD_PUMP_ON, eSetValueWithOverwrite);
+          Serial.println("[Control] AUTO → Pump ON");
+        }
+        else if (soilValue >= SOIL_DRY_THRESHOLD && state != AUTO_OFF) {
+          state = AUTO_OFF;
+          xTaskNotify(relayTaskHandle, CMD_PUMP_OFF, eSetValueWithOverwrite);
+          Serial.println("[Control] AUTO → Pump OFF");
+        }
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 }
 
-/* ================= RELAY TASK =================
- * Drives pump hardware ONLY
- ****************************************************/
+/* ================= RELAY TASK ================= */
 void relayTask(void *pvParameters) {
-  uint32_t command;
-
+  uint32_t cmd;
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, LOW);  // Pump OFF initially
+  digitalWrite(RELAY_PIN, LOW);
 
   while (1) {
-    // Wait indefinitely for control command
-    xTaskNotifyWait(
-      0,
-      0,
-      &command,
-      portMAX_DELAY
-    );
-
-    if (command == PUMP_ON) {
-      digitalWrite(RELAY_PIN, HIGH);
-      Serial.println("[Relay] Pump ON");
-    } else {
-      digitalWrite(RELAY_PIN, LOW);
-      Serial.println("[Relay] Pump OFF");
-    }
-  }
-}
-
-/* ================= COMM TASK =================
- * Placeholder for Bluetooth / WiFi / SIM800L
- ****************************************************/
-void commTask(void *pvParameters) {
-  while (1) {
-    // Communication logic will be added later
-    vTaskDelay(pdMS_TO_TICKS(500));
+    xTaskNotifyWait(0, 0, &cmd, portMAX_DELAY);
+    digitalWrite(RELAY_PIN, (cmd == CMD_PUMP_ON));
+    Serial.println(cmd == CMD_PUMP_ON ? "[Relay] Pump ON" : "[Relay] Pump OFF");
   }
 }
 
@@ -132,26 +164,22 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("ESP32 RTOS Smart Pump Controller (AUTO Mode)");
+  soilQueue    = xQueueCreate(5, sizeof(int));
+  commandQueue = xQueueCreate(5, sizeof(PumpCommand));
 
-  /* -------- Create Queue -------- */
-  soilQueue = xQueueCreate(5, sizeof(int));
-  if (soilQueue == NULL) {
-    Serial.println("❌ Soil queue creation failed");
-    while (1);  // Fatal error
+  if (!soilQueue || !commandQueue) {
+    Serial.println("❌ Queue creation failed");
+    while (1);
   }
 
-  /* -------- Create Tasks -------- */
   xTaskCreate(heartbeatTask, "Heartbeat", 1024, NULL, 0, NULL);
   xTaskCreate(sensorTask,    "Sensor",    2048, NULL, 1, NULL);
+  xTaskCreate(serialTask,    "Serial",    2048, NULL, 1, NULL);
   xTaskCreate(controlTask,   "Control",   4096, NULL, 3, NULL);
   xTaskCreate(relayTask,     "Relay",     2048, NULL, 2, &relayTaskHandle);
-  xTaskCreate(commTask,      "Comm",      2048, NULL, 1, NULL);
 
-  Serial.println("✅ RTOS system started successfully");
+  Serial.println("✅ Pump Controller Ready (AUTO + SERIAL MANUAL)");
 }
 
 /* ================= LOOP ================= */
-void loop() {
-  // Empty - FreeRTOS scheduler is running
-}
+void loop() {}
